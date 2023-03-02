@@ -1,9 +1,9 @@
 import os
-from typing import List
 
 import torch
 from cog import BasePredictor, Input, Path
 from diffusers import (
+    StableDiffusionLatentUpscalePipeline,
     StableDiffusionPipeline,
     PNDMScheduler,
     LMSDiscreteScheduler,
@@ -12,35 +12,44 @@ from diffusers import (
     EulerAncestralDiscreteScheduler,
     DPMSolverMultistepScheduler,
 )
-from diffusers.pipelines.stable_diffusion.safety_checker import (
-    StableDiffusionSafetyChecker,
-)
 
 
-MODEL_ID = "andite/anything-v4.0"
+MODEL_IDs = [
+    "stabilityai/stable-diffusion-2-1",
+    "runwayml/stable-diffusion-v1-5",
+    "andite/anything-v4.0",
+]
 MODEL_CACHE = "diffusers-cache"
-SAFETY_MODEL_ID = "CompVis/stable-diffusion-safety-checker"
 
 
 class Predictor(BasePredictor):
     def setup(self):
         """Load the model into memory to make running multiple predictions efficient"""
         print("Loading pipeline...")
-        safety_checker = StableDiffusionSafetyChecker.from_pretrained(
-            SAFETY_MODEL_ID,
+        self.pipes = {
+            MODEL_ID.split("/")[-1]: StableDiffusionPipeline.from_pretrained(
+                MODEL_ID,
+                cache_dir=MODEL_CACHE,
+                local_files_only=True,
+                torch_dtype=torch.float16,
+            ).to("cuda")
+            for MODEL_ID in MODEL_IDs
+        }
+        self.upscaler = StableDiffusionLatentUpscalePipeline.from_pretrained(
+            "stabilityai/sd-x2-latent-upscaler",
             cache_dir=MODEL_CACHE,
             local_files_only=True,
-        )
-        self.pipe = StableDiffusionPipeline.from_pretrained(
-            MODEL_ID,
-            safety_checker=safety_checker,
-            cache_dir=MODEL_CACHE,
-            local_files_only=True,
+            torch_dtype=torch.float16,
         ).to("cuda")
 
     @torch.inference_mode()
     def predict(
         self,
+        model: str = Input(
+            choices=["stable-diffusion-2-1", "stable-diffusion-v1-5", "anything-v4.0"],
+            default="stable-diffusion-2-1",
+            description="Choose a model.",
+        ),
         prompt: str = Input(
             description="Input prompt",
             default="a photo of an astronaut riding a horse on mars",
@@ -50,24 +59,14 @@ class Predictor(BasePredictor):
             default=None,
         ),
         width: int = Input(
-            description="Width of output image. Maximum size is 1024x768 or 768x1024 because of memory limits",
+            description="Width of output image before upscaling. Final output will double the width. Lower the setting if run out of memory.",
             choices=[128, 256, 384, 448, 512, 576, 640, 704, 768, 832, 896, 960, 1024],
             default=768,
         ),
         height: int = Input(
-            description="Height of output image. Maximum size is 1024x768 or 768x1024 because of memory limits",
+            description="Height of output image. Final output will double the height. Lower the setting if run out of memory.",
             choices=[128, 256, 384, 448, 512, 576, 640, 704, 768, 832, 896, 960, 1024],
             default=768,
-        ),
-        prompt_strength: float = Input(
-            description="Prompt strength when using init image. 1.0 corresponds to full destruction of information in init image",
-            default=0.8,
-        ),
-        num_outputs: int = Input(
-            description="Number of images to output.",
-            ge=1,
-            le=4,
-            default=1,
         ),
         num_inference_steps: int = Input(
             description="Number of denoising steps", ge=1, le=500, default=50
@@ -90,7 +89,7 @@ class Predictor(BasePredictor):
         seed: int = Input(
             description="Random seed. Leave blank to randomize the seed", default=None
         ),
-    ) -> List[Path]:
+    ) -> Path:
         """Run a single prediction on the model"""
         if seed is None:
             seed = int.from_bytes(os.urandom(2), "big")
@@ -101,36 +100,34 @@ class Predictor(BasePredictor):
                 "Maximum size is 1024x768 or 768x1024 pixels, because of memory limits. Please select a lower width or height."
             )
 
-        self.pipe.scheduler = make_scheduler(scheduler, self.pipe.scheduler.config)
+        pipe = self.pipes[model]
+        pipe.scheduler = make_scheduler(scheduler, pipe.scheduler.config)
 
         generator = torch.Generator("cuda").manual_seed(seed)
-        output = self.pipe(
-            prompt=[prompt] * num_outputs if prompt is not None else None,
-            negative_prompt=[negative_prompt] * num_outputs
-            if negative_prompt is not None
-            else None,
+        low_res_latents = pipe(
+            prompt=prompt if prompt is not None else None,
+            negative_prompt=negative_prompt if negative_prompt is not None else None,
             width=width,
             height=height,
             guidance_scale=guidance_scale,
             generator=generator,
             num_inference_steps=num_inference_steps,
-        )
+            output_type="latent",
+        ).images
 
-        output_paths = []
-        for i, sample in enumerate(output.images):
-            if output.nsfw_content_detected and output.nsfw_content_detected[i]:
-                continue
+        upscaled_image = self.upscaler(
+            prompt=prompt if prompt is not None else None,
+            negative_prompt=negative_prompt if negative_prompt is not None else None,
+            image=low_res_latents,
+            num_inference_steps=20,
+            guidance_scale=0,
+            generator=generator,
+        ).images[0]
 
-            output_path = f"/tmp/out-{i}.png"
-            sample.save(output_path)
-            output_paths.append(Path(output_path))
+        output_path = f"/tmp/out.png"
+        upscaled_image.save(output_path)
 
-        if len(output_paths) == 0:
-            raise Exception(
-                f"NSFW content detected. Try running it again, or try a different prompt."
-            )
-
-        return output_paths
+        return Path(output_path)
 
 
 def make_scheduler(name, config):
